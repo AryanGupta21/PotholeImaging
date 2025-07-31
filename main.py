@@ -19,6 +19,11 @@ import seaborn as sns
 from mpl_toolkits.mplot3d import Axes3D
 import plotly.graph_objects as go
 import plotly.express as px
+from scipy import ndimage
+from skimage import feature, morphology, measure, segmentation
+from skimage.segmentation import watershed
+from scipy.ndimage import maximum_filter
+from scipy.spatial.distance import cdist
 
 class PotholeAnalyzer3D:
     def __init__(self):
@@ -118,29 +123,107 @@ class PotholeAnalyzer3D:
         return depth_map
     
     def detect_pothole_regions(self, depth_map, sensitivity=0.15):
-        """Detect pothole regions in depth map"""
+        """Detect pothole regions in depth map with improved accuracy"""
         print(f"🎯 Detecting pothole regions (sensitivity: {sensitivity})...")
         
         height, width = depth_map.shape
         
-        # Find deeper regions (potential potholes)
-        depth_threshold = np.percentile(depth_map, (1 - sensitivity) * 100)
-        pothole_mask = depth_map > depth_threshold
+        # Apply Gaussian filter to smooth the depth map
+        smoothed_depth = ndimage.gaussian_filter(depth_map, sigma=2)
         
-        # Morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Find local minima (potential potholes are deeper/darker regions)
+        # Invert depth map so potholes become local maxima
+        inverted_depth = 1.0 - smoothed_depth
+        
+        # Use adaptive thresholding based on local statistics
+        threshold_value = np.percentile(inverted_depth, 85 + (sensitivity * 50))
+        
+        # Create binary mask for potential potholes
+        pothole_mask = inverted_depth > threshold_value
+        
+        # Clean up the mask with morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         pothole_mask = cv2.morphologyEx(pothole_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
         pothole_mask = cv2.morphologyEx(pothole_mask, cv2.MORPH_OPEN, kernel)
         
         # Find contours
         contours, _ = cv2.findContours(pothole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Filter by size
-        min_area = (width * height) * 0.001
-        valid_contours = [c for c in contours if cv2.contourArea(c) > min_area]
+        # Advanced filtering of contours
+        valid_contours = []
+        min_area = (width * height) * 0.0005  # Minimum 0.05% of image
+        max_area = (width * height) * 0.3     # Maximum 30% of image
         
-        print(f"✅ Found {len(valid_contours)} potential potholes")
-        return pothole_mask, valid_contours
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            # Size filter
+            if area < min_area or area > max_area:
+                continue
+            
+            # Shape filter - reject very elongated shapes (likely cracks, not potholes)
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else float('inf')
+            
+            if aspect_ratio > 4:  # Reject very elongated shapes (reduced from 5)
+                continue
+            
+            # Solidity filter - potholes should be reasonably solid shapes
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+            
+            if solidity < 0.4:  # Reject very non-convex shapes (increased from 0.3)
+                continue
+            
+            # Position filter - avoid edges of image (often artifacts)
+            center_x = x + w // 2
+            center_y = y + h // 2
+            
+            margin = min(width, height) * 0.05  # Reduced margin to 5%
+            if (center_x < margin or center_x > width - margin or 
+                center_y < margin or center_y > height - margin):
+                continue
+            
+            # Circularity filter - potholes are usually somewhat circular
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                if circularity < 0.3:  # Reject very non-circular shapes
+                    continue
+            
+            # Depth verification - check if region is actually deeper
+            mask = np.zeros(depth_map.shape, dtype=np.uint8)
+            cv2.fillPoly(mask, [contour], 1)
+            region_depths = smoothed_depth[mask.astype(bool)]
+            
+            if len(region_depths) > 0:
+                # Compare region depth with surrounding area
+                # Create expanded mask for surrounding area
+                kernel_expand = np.ones((15, 15), np.uint8)
+                expanded_mask = cv2.dilate(mask, kernel_expand, iterations=1)
+                surrounding_mask = expanded_mask - mask
+                surrounding_depths = smoothed_depth[surrounding_mask.astype(bool)]
+                
+                if len(surrounding_depths) > 0:
+                    region_mean_depth = np.mean(region_depths)
+                    surrounding_mean_depth = np.mean(surrounding_depths)
+                    
+                    # Pothole should be deeper (higher normalized depth) than surroundings
+                    depth_difference = region_mean_depth - surrounding_mean_depth
+                    
+                    if depth_difference < 0.03:  # Minimum depth difference (reduced threshold)
+                        continue
+            
+            valid_contours.append(contour)
+        
+        # Create final mask from valid contours
+        final_mask = np.zeros(depth_map.shape, dtype=np.uint8)
+        if valid_contours:
+            cv2.fillPoly(final_mask, valid_contours, 1)
+        
+        print(f"✅ Found {len(valid_contours)} valid potholes (filtered from {len(contours)} initial detections)")
+        return final_mask.astype(bool), valid_contours
     
     def analyze_potholes(self, depth_map, contours, pixel_scale=None):
         """Analyze detected potholes and extract measurements"""
@@ -318,6 +401,9 @@ class PotholeAnalyzer3D:
         
         os.makedirs(output_dir, exist_ok=True)
         
+        # 0. Debug visualization (NEW - helps understand detection process)
+        self.create_debug_visualization(original_image, depth_map_dpt, contours, output_dir)
+        
         # 1. Depth comparison visualization
         self._create_depth_comparison(original_image, depth_map_dpt, depth_map_midas, output_dir)
         
@@ -488,7 +574,108 @@ class PotholeAnalyzer3D:
         plt.savefig(f"{output_dir}/analysis_dashboard.png", dpi=300, bbox_inches='tight')
         plt.close()
     
+    def create_debug_visualization(self, original_image, depth_map, contours, output_dir):
+        """Create detailed debug visualization to understand detection process"""
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # 1. Original image
+        axes[0, 0].imshow(original_image)
+        axes[0, 0].set_title('Original Image', fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        # 2. Raw depth map
+        im1 = axes[0, 1].imshow(depth_map, cmap='plasma')
+        axes[0, 1].set_title('Raw Depth Map', fontweight='bold')
+        axes[0, 1].axis('off')
+        plt.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+        
+        # 3. Inverted depth (potholes as bright spots)
+        inverted_depth = 1.0 - depth_map
+        im2 = axes[0, 2].imshow(inverted_depth, cmap='hot')
+        axes[0, 2].set_title('Inverted Depth (Potholes=Bright)', fontweight='bold')
+        axes[0, 2].axis('off')
+        plt.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
+        
+        # 4. Thresholded mask
+        threshold_value = np.percentile(inverted_depth, 85)
+        binary_mask = inverted_depth > threshold_value
+        axes[1, 0].imshow(binary_mask, cmap='gray')
+        axes[1, 0].set_title(f'Binary Mask (threshold={threshold_value:.2f})', fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        # 5. Detected contours on original
+        axes[1, 1].imshow(original_image)
+        colors = ['red', 'blue', 'green', 'yellow', 'purple', 'orange']
+        for i, contour in enumerate(contours):
+            color = colors[i % len(colors)]
+            x, y, w, h = cv2.boundingRect(contour)
+            rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor=color, facecolor='none')
+            axes[1, 1].add_patch(rect)
+            
+            # Add center point
+            center_x, center_y = x + w//2, y + h//2
+            axes[1, 1].plot(center_x, center_y, 'o', color=color, markersize=8)
+            axes[1, 1].text(center_x, center_y-10, f'P{i+1}', color=color, fontweight='bold')
+        
+        axes[1, 1].set_title(f'Detected Potholes ({len(contours)} found)', fontweight='bold')
+        axes[1, 1].axis('off')
+        
+        # 6. Depth profile analysis
+        if contours:
+            # Show depth profile of first detected pothole
+            contour = contours[0]
+            mask = np.zeros(depth_map.shape, dtype=np.uint8)
+            cv2.fillPoly(mask, [contour], 1)
+            
+            # Get bounding box
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Extract depth profile along the center line
+            center_y_line = y + h // 2
+            if center_y_line < depth_map.shape[0]:
+                depth_profile = depth_map[center_y_line, x:x+w]
+                axes[1, 2].plot(range(len(depth_profile)), depth_profile, 'b-', linewidth=2)
+                axes[1, 2].set_title('Depth Profile (Center Line)', fontweight='bold')
+                axes[1, 2].set_xlabel('X Position (pixels)')
+                axes[1, 2].set_ylabel('Normalized Depth')
+                axes[1, 2].grid(True, alpha=0.3)
+        else:
+            axes[1, 2].text(0.5, 0.5, 'No potholes detected', ha='center', va='center', 
+                           transform=axes[1, 2].transAxes, fontsize=14)
+            axes[1, 2].set_title('No Analysis Available', fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/debug_detection_process.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"🔍 Debug visualization saved: {output_dir}/debug_detection_process.png")
+    
     def _create_interactive_3d(self, depth_map, output_dir):
+        """Create interactive 3D visualization with Plotly"""
+        try:
+            # Subsample for performance
+            step = max(1, depth_map.shape[0] // 50)
+            y, x = np.mgrid[0:depth_map.shape[0]:step, 0:depth_map.shape[1]:step]
+            z = depth_map[::step, ::step]
+            
+            fig = go.Figure(data=[go.Surface(z=z, x=x, y=y, colorscale='Viridis')])
+            
+            fig.update_layout(
+                title='Interactive 3D Road Surface',
+                scene=dict(
+                    xaxis_title='X (pixels)',
+                    yaxis_title='Y (pixels)',
+                    zaxis_title='Depth (normalized)'
+                ),
+                width=800,
+                height=600
+            )
+            
+            fig.write_html(f"{output_dir}/interactive_3d.html")
+            print("📱 Interactive 3D visualization saved as HTML")
+            
+        except ImportError:
+            print("⚠️  Plotly not available, skipping interactive 3D visualization")
         """Create interactive 3D visualization with Plotly"""
         try:
             # Subsample for performance
@@ -577,7 +764,7 @@ def process_pothole_image(image_path, output_dir=None, sensitivity=0.15):
 
 if __name__ == "__main__":
     # Example usage
-    image_path = "image2.png"  # Change this to your image path
+    image_path = "pothole_sample.jpg"  # Change this to your image path
     
     # Process the image
     result = process_pothole_image(image_path, sensitivity=0.15)
